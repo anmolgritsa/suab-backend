@@ -491,7 +491,61 @@ the only guard.
 
 ---
 
-## 9. CORS
+## 9. Work submissions (auth required)
+
+Base: `https://ooyidpdgnelhxpoxjlkv.supabase.co/functions/v1/work-submission`
+
+### POST /work-submission — log output against one of my assignments
+
+```json
+{
+  "work_assignment_id": "uuid — required, must be YOUR assignment",
+  "quantity_successful": 120,
+  "quantity_rejected": 8,
+  "quantity_reusable": 3,
+  "attachment_url": "https://example.com/voice-note.m4a",
+  "notes": "Line A output"
+}
+```
+
+- `work_assignment_id` required (UUID). `quantity_successful` defaults to 0;
+  at least one of the three quantities must be > 0. `notes` ≤ 500 chars.
+  `attachment_url` optional http(s) URL ≤ 1000 chars (voice note or image).
+- The assignment must be `in_progress` or `completed` (`pending`/`cancelled`
+  → `409`). Multiple submissions per assignment are allowed (piece-rate logs).
+- The successful quantity is stored in the existing `quantity` column;
+  `quantity_rejected` / `quantity_reusable` / `attachment_url` need migration
+  `20261113170001` — until it is applied those fields are accepted but NOT
+  stored and the `201` response carries an explicit `warning`.
+
+Errors: `400` bad/missing id, non-integer/negative quantities, all-zero
+quantities, bad attachment URL · `403` profile not active · `404` assignment
+not found or not yours · `409` assignment not in a submittable state ·
+`401` bad token · `405` wrong method.
+
+`201`:
+```json
+{ "data": { "id": "…", "work_assignment_id": "…",
+  "assignment": { "title": "Dyeing unit support - batch 12", "machine_number": "DY-02",
+                  "product_type": "Polyester b", "quantity_target": 500, "status": "in_progress" },
+  "quantity_successful": 120, "quantity_rejected": 8, "quantity_reusable": 3,
+  "attachment_url": "https://…", "notes": "Line A output", "submitted_at": "…" } }
+```
+
+### GET /work-submission — my submissions, newest first
+
+Optional filter: `?assignment_id=<uuid>` (anything non-UUID → `400`).
+
+```bash
+curl.exe -s "https://ooyidpdgnelhxpoxjlkv.supabase.co/functions/v1/work-submission" -H "Authorization: Bearer USER_JWT"
+```
+
+`200`: `{ "data": [ …same shape as the 201 above… ] }` — each row embeds the
+assignment (title, machine number, product type, target, status).
+
+---
+
+## 10. CORS
 
 All endpoints answer `OPTIONS` with `200` and permissive CORS headers, so you can
 also call them from a browser app.
