@@ -1,0 +1,3 @@
+# SQL migrations for Suab live here.
+# Create one with: npx supabase migration new <name>
+# Apply with:      npx supabase db push   (remote)  /  npx supabase db reset   (local)

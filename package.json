@@ -1,0 +1,36 @@
+
+{
+  "name": "suab-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Suab backend — Supabase PostgreSQL, Edge Functions (Deno), Auth and Storage scaffold.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "supabase start && supabase functions serve",
+    "typecheck": "tsc --noEmit",
+    "functions:check": "deno check --config supabase/functions/deno.json supabase/functions/health/index.ts supabase/functions/labour-profile/index.ts",
+    "start": "supabase start",
+    "stop": "supabase stop",
+    "status": "supabase status",
+    "functions:serve": "supabase functions serve",
+    "functions:deploy": "supabase functions deploy --yes",
+    "db:migration:new": "supabase migration new",
+    "db:push": "supabase db push",
+    "db:reset": "supabase db reset",
+    "gen:types": "supabase gen types typescript --local --schema public > types/database.generated.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "deno": "^2.9.6",
+    "pg": "^8.23.1",
+    "supabase": "^3.1.0",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.119.0"
+  }
+}

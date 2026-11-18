@@ -1,0 +1,22 @@
+{
+  "version": "5",
+  "redirects": {
+    "https://esm.sh/@supabase/supabase-js@2": "https://esm.sh/@supabase/supabase-js@2.119.0"
+  },
+  "remote": {
+    "https://esm.sh/@supabase/supabase-js@2.119.0": "5b053344a262b305cfd47fdd75b3d244e47983d70fd7f7e68dc4dbbb98bc90bc"
+  },
+  "workspace": {
+    "packageJson": {
+      "dependencies": [
+        "npm:@supabase/supabase-js@^2.119.0",
+        "npm:@types/node@^26.6.6",
+        "npm:@types/pg@^8.23.1",
+        "npm:deno@^2.9.6",
+        "npm:pg@^8.23.1",
+        "npm:supabase@^3.1.0",
+        "npm:typescript@^7.0.2"
+      ]
+    }
+  }
+}
