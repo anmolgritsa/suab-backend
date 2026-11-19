@@ -648,7 +648,85 @@ bad date / `from > to` · `404` unknown route · `405` non-GET.
 
 ---
 
-## 12. CORS
+## 12. Supervisor — machine assignments (Step 4.11)
+
+Base: `https://ooyidpdgnelhxpoxjlkv.supabase.co/functions/v1/supervisor`
+(same function as §10–§11; supervisor token required on all three).
+
+### POST /supervisor/assignments — assign a machine/task
+
+Body (all of `labour_id`, `title`, `machine_number`, `product_type`,
+`quantity_target` required; `due_date`, `instructions` optional):
+
+```json
+{
+  "labour_id": "8acf0cb9-4dcb-4574-8bb6-e0bfa164ee92",
+  "title": "Weaving shift A - batch 21",
+  "machine_number": "MC-11",
+  "product_type": "Cotton fabric 60s",
+  "quantity_target": 250,
+  "due_date": "2026-11-25",
+  "instructions": "Check tension every 2 hours"
+}
+```
+
+Response `201`:
+
+```json
+{
+  "data": {
+    "id": "cc59e30e-...",
+    "title": "Weaving shift A - batch 21",
+    "machine_number": "MC-11",
+    "product_type": "Cotton fabric 60s",
+    "quantity_target": 250,
+    "due_date": "2026-11-25",
+    "status": "pending",
+    "assigned_by": null,
+    "assignment_date": "2026-11-18T..."
+  }
+}
+```
+
+Notes:
+- The labourer must belong to the supervisor's company and be an **active
+  worker** (assigning a supervisor → 400; another company's labourer → 404).
+- Machine/product/instructions are stored in `description` using the shared
+  `"Machine X | Product: Y | Instructions: Z"` convention (no dedicated
+  columns in the schema).
+- `assigned_by` stays `null` until migration `20261113180001` is applied;
+  until then the response carries a `warning` saying so.
+
+### GET /supervisor/assignments — list (filters optional)
+
+`?labour_id=<uuid>` · `?date=YYYY-MM-DD` (creation day, company timezone) ·
+`?status=pending|in_progress|completed|cancelled|overdue`
+
+Response `200`: `{ "data": [ { ...same shape as POST..., "labour": { "id",
+"name", "employee_code" } } ] }` — newest first, max 200.
+
+### PATCH /supervisor/assignments — update status
+
+Body: `{ "assignment_id": "<uuid>", "status": "<new status>" }`
+
+Allowed transitions (supervisor-side):
+
+| From | To |
+|---|---|
+| `pending` | `in_progress`, `cancelled`, `overdue` |
+| `in_progress` | `completed`, `cancelled`, `overdue` |
+| `overdue` | `in_progress`, `cancelled` |
+
+`completed` and `cancelled` are **frozen** — any change returns `409`. Setting
+the same status again → `409`. Invalid transition → `409` with the allowed
+list. Unknown id → `404`. Bad UUID / bad status / missing id → `400`.
+
+Errors everywhere: `401` no/bad token · `403` not a supervisor · `404` unknown
+route · `405` non-GET/POST/PATCH.
+
+---
+
+## 13. CORS
 
 All endpoints answer `OPTIONS` with `200` and permissive CORS headers, so you can
 also call them from a browser app.

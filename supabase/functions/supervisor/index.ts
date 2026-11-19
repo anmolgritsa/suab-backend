@@ -9,6 +9,9 @@
 //                                          (filters: ?labour_id= ?date= ?from= ?to=)
 //   GET /supervisor/attendance-summary  -> present/absent/half-day counts for one date
 //                                          (?date=YYYY-MM-DD, default = today)
+//   POST   /supervisor/assignments      -> assign a machine/task to a labourer
+//   GET    /supervisor/assignments      -> assignments I created (?labour_id= ?date= ?status=)
+//   PATCH  /supervisor/assignments      -> update one assignment's status
 //
 // AUTH
 //   Same pattern as the other functions: anon key + the caller's user JWT.
@@ -33,6 +36,15 @@
 //   present/absent/late/half_day/leave/holiday/on_duty), timestamps.
 //   - attendance.date is already the company-timezone calendar day (the
 //     attendance function writes it that way), so date filters compare directly.
+//   work_assignments: id, company_id, labour_profile_id, title, description,
+//   quantity_target, rate_per_unit, due_date, status, accepted_at, timestamps.
+//   - No machine/product columns: they are parsed from description
+//     ("Machine MC-07 | Product: ...") — same convention everywhere.
+//   - No supervisor column either: migration 20261113180001 (DRAFT, not
+//     applied) adds assigned_by -> labour_profiles.id. Until then the create
+//     endpoint skips that column and says so in the response.
+//   - assignment_status enum: pending | in_progress | completed | cancelled
+//     | overdue.
 //
 // DATE HANDLING
 //   ?date / ?from / ?to are company-timezone calendar dates (companies.settings
@@ -52,6 +64,25 @@ interface SupervisorProfile {
   company_id: string;
   status: string;
   role: string | null;
+}
+
+// Valid values of the assignment_status enum (same list as the assignments fn).
+const STATUSES = ['pending', 'in_progress', 'completed', 'cancelled', 'overdue'] as const;
+
+interface AssignmentRow {
+  id: string;
+  company_id: string;
+  labour_profile_id: string;
+  title: string;
+  description: string | null;
+  quantity_target: number | null;
+  rate_per_unit: string | null;
+  due_date: string | null;
+  status: string;
+  accepted_at?: string | null;
+  assigned_by?: string | null; // exists after migration 20261113180001
+  created_at: string;
+  updated_at: string;
 }
 
 interface SubmissionRow {
@@ -82,11 +113,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
   const preflight = OPTIONS(req);
   if (preflight) return preflight;
 
-  // Read-only API: only GET is supported.
-  if (req.method !== 'GET') {
-    return methodNotAllowed(['GET', 'OPTIONS']);
+  // Supported methods: GET (read), POST (create assignment), PATCH (update
+  // assignment status). Everything else -> 405.
+  if (req.method !== 'GET' && req.method !== 'POST' && req.method !== 'PATCH') {
+    return methodNotAllowed(['GET', 'POST', 'PATCH', 'OPTIONS']);
   }
-
   // Read + decode the JWT from the Authorization header.
   let userId: string;
   let jwt: string;
@@ -109,7 +140,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
     if (route === 'work-summary') return await handleSummary(req, supabase, userId);
     if (route === 'attendance') return await handleAttendance(req, supabase, userId);
     if (route === 'attendance-summary') return await handleAttendanceSummary(req, supabase, userId);
-    return json({ error: 'Unknown route. Use GET /supervisor/work-history, /supervisor/work-summary, /supervisor/attendance or /supervisor/attendance-summary' }, 404);
+    if (route === 'assignments') {
+      if (req.method === 'POST') return await handleCreateAssignment(req, supabase, userId);
+      if (req.method === 'PATCH') return await handleUpdateAssignment(req, supabase, userId);
+      return await handleListAssignments(req, supabase, userId); // GET
+    }
+    return json({ error: 'Unknown route. Use /supervisor/work-history, /supervisor/work-summary, /supervisor/attendance, /supervisor/attendance-summary or /supervisor/assignments' }, 404);
   } catch (err) {
     console.error('[supervisor] unhandled error:', err);
     return json({ error: 'Internal server error' }, 500);
@@ -356,6 +392,276 @@ async function handleAttendanceSummary(
 }
 
 // ---------------------------------------------------------------------------
+// POST /supervisor/assignments — assign a machine/task to a labourer
+// ---------------------------------------------------------------------------
+// Body: { labour_id, title, machine_number, product_type, quantity_target,
+//         due_date?, instructions? }
+// The machine + product are stored in `description` using the shared
+// "Machine X | Product: Y" convention (the schema has no dedicated columns).
+async function handleCreateAssignment(
+  req: Request,
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. Parse the JSON body.
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: 'Request body must be valid JSON' }, 400);
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return json({ error: 'Request body must be a JSON object' }, 400);
+  }
+  const b = body as Record<string, unknown>;
+
+  // 3. Required fields: labour_id (uuid), title, machine_number,
+  //    product_type, quantity_target (positive whole number).
+  const labourId = b['labour_id'];
+  if (typeof labourId !== 'string' || labourId.length === 0) {
+    return json({ error: 'labour_id is required (uuid of the labourer profile)' }, 400);
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(labourId)) {
+    return json({ error: 'labour_id must be a valid UUID' }, 400);
+  }
+  const title = typeof b['title'] === 'string' ? b['title'].trim() : '';
+  if (!title) return json({ error: 'title is required' }, 400);
+  if (title.length > 200) return json({ error: 'title must be 200 characters or fewer' }, 400);
+  const machine = typeof b['machine_number'] === 'string' ? b['machine_number'].trim() : '';
+  if (!machine) return json({ error: 'machine_number is required' }, 400);
+  if (machine.length > 60) return json({ error: 'machine_number must be 60 characters or fewer' }, 400);
+  const product = typeof b['product_type'] === 'string' ? b['product_type'].trim() : '';
+  if (!product) return json({ error: 'product_type is required' }, 400);
+  if (product.length > 200) return json({ error: 'product_type must be 200 characters or fewer' }, 400);
+  const target = b['quantity_target'];
+  if (typeof target !== 'number' || !Number.isInteger(target) || target <= 0) {
+    return json({ error: 'quantity_target must be a positive whole number' }, 400);
+  }
+
+  // 4. Optional fields: due_date (calendar date) and instructions (text).
+  const dueDate = typeof b['due_date'] === 'string' ? b['due_date'].trim() : '';
+  if (dueDate && !isValidDate(dueDate)) {
+    return json({ error: 'due_date must be a valid calendar date in YYYY-MM-DD format' }, 400);
+  }
+  const instructions = typeof b['instructions'] === 'string' ? b['instructions'].trim() : '';
+  if (instructions.length > 500) {
+    return json({ error: 'instructions must be 500 characters or fewer' }, 400);
+  }
+
+  // 5. The labourer must exist, belong to MY company, and be a worker.
+  const { data: labour, error: labourErr } = await supabase
+    .from('labour_profiles')
+    .select('id, company_id, role, status')
+    .eq('id', labourId)
+    .maybeSingle();
+  if (labourErr) throw new Error(`labour lookup failed: ${labourErr.message}`);
+  const worker = labour as { id: string; company_id: string; role: string | null; status: string } | null;
+  if (!worker || worker.company_id !== supervisor.company_id) {
+    // Same 404 for "unknown" and "another company's" labourer — no leak.
+    return json({ error: 'Labourer not found in your company' }, 404);
+  }
+  const workerRole = (worker.role ?? '').toLowerCase();
+  if ((SUPERVISOR_ROLES as readonly string[]).includes(workerRole)) {
+    return json({ error: 'Assignments can only be given to labourers (not supervisors)' }, 400);
+  }
+  if (worker.status !== 'active') {
+    return json({ error: `Labourer profile status is '${worker.status}' — only active labourers can be assigned` }, 400);
+  }
+
+  // 6. Insert. assigned_by only exists after migration 20261113180001 —
+  //    retry without it so the endpoint works before the migration too.
+  const description = `Machine ${machine} | Product: ${product}${instructions ? ` | Instructions: ${instructions}` : ''}`;
+  const insert: Record<string, unknown> = {
+    company_id: supervisor.company_id,
+    labour_profile_id: worker.id,
+    title,
+    description,
+    quantity_target: target,
+    status: 'pending',
+  };
+  if (dueDate) insert['due_date'] = dueDate;
+  insert['assigned_by'] = supervisor.id;
+
+  let created: { data: AssignmentRow[] | null; error: { message: string; code?: string } | null } =
+    await supabase.from('work_assignments').insert(insert).select();
+
+  // Missing column -> PGRST204 (schema cache) or 42703 (undefined column).
+  if (created.error?.code === 'PGRST204' || created.error?.code === '42703') {
+    delete insert['assigned_by'];
+    created = await supabase.from('work_assignments').insert(insert).select();
+  }
+  if (created.error) {
+    console.error('[supervisor] assignment insert error:', created.error.message);
+    return json({ error: 'Failed to create assignment' }, 500);
+  }
+  const row = (created.data ?? [])[0] as AssignmentRow | undefined;
+  if (!row) return json({ error: 'Failed to create assignment' }, 500);
+
+  // 7. Tell the caller when the supervisor-attribution column is missing.
+  const response: Record<string, unknown> = { data: shapeAssignment(row) };
+  if (!('assigned_by' in insert)) {
+    response['warning'] = 'assigned_by was NOT stored — migration 20261113180001 must be applied first';
+  }
+  return json(response, 201);
+}
+
+// ---------------------------------------------------------------------------
+// GET /supervisor/assignments — assignments I created (with filters)
+// ---------------------------------------------------------------------------
+async function handleListAssignments(
+  req: Request,
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. Validate the optional filters: ?labour_id= ?date= ?status=.
+  const url = new URL(req.url);
+  const labourId = url.searchParams.get('labour_id');
+  if (labourId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(labourId)) {
+    return json({ error: 'labour_id must be a valid UUID' }, 400);
+  }
+  const date = url.searchParams.get('date');
+  if (date && !isValidDate(date)) {
+    return json({ error: 'date must be a valid calendar date in YYYY-MM-DD format' }, 400);
+  }
+  const status = url.searchParams.get('status');
+  if (status && !STATUSES.includes(status as typeof STATUSES[number])) {
+    return json({ error: `status must be one of: ${STATUSES.join(', ')}` }, 400);
+  }
+
+  // 3. Query assignments in MY company, newest first, labourer embedded.
+  //    RLS (company-wide SELECT) makes this legal.
+  let query = supabase
+    .from('work_assignments')
+    .select('*, labour_profiles(id, full_name, employee_code)')
+    .eq('company_id', supervisor.company_id)
+    .order('created_at', { ascending: false })
+    .limit(200);
+
+  if (labourId) query = query.eq('labour_profile_id', labourId);
+  if (date) {
+    // ?date= filters on the assignment's creation day (company timezone ->
+    // UTC window, same convention as the other date filters).
+    const tz = await companyTimezone(supabase, supervisor.company_id);
+    query = query.gte('created_at', dayStartUtc(date, tz)).lte('created_at', dayEndUtc(date, tz));
+  }
+  if (status) query = query.eq('status', status);
+
+  const { data, error } = await query;
+  if (error) throw new Error(`assignments query failed: ${error.message}`);
+
+  // 4. Shape each row (machine/product parsed from description).
+  const rows = ((data ?? []) as (AssignmentRow & { labour_profiles?: { id: string; full_name: string; employee_code: string } | null })[])
+    .map((r) => {
+      const shaped = shapeAssignment(r);
+      const lp = r.labour_profiles ?? null;
+      return { ...shaped, labour: lp ? { id: lp.id, name: lp.full_name, employee_code: lp.employee_code } : null };
+    });
+  return json({ data: rows }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /supervisor/assignments — update one assignment's status
+// ---------------------------------------------------------------------------
+// Body: { assignment_id, status } — status must be a valid enum value and a
+// permitted transition. Completed/cancelled assignments are frozen.
+async function handleUpdateAssignment(
+  req: Request,
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. Parse the JSON body: { assignment_id, status }.
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: 'Request body must be valid JSON' }, 400);
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return json({ error: 'Request body must be a JSON object' }, 400);
+  }
+  const b = body as Record<string, unknown>;
+  const assignmentId = b['assignment_id'];
+  if (typeof assignmentId !== 'string' || assignmentId.length === 0) {
+    return json({ error: 'assignment_id is required (uuid of the assignment to update)' }, 400);
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(assignmentId)) {
+    return json({ error: 'assignment_id must be a valid UUID — copy an id from GET /supervisor/assignments' }, 400);
+  }
+  const nextStatus = b['status'];
+  if (typeof nextStatus !== 'string' || !STATUSES.includes(nextStatus as typeof STATUSES[number])) {
+    return json({ error: `status must be one of: ${STATUSES.join(', ')}` }, 400);
+  }
+
+  // 3. Load the assignment — must exist in MY company.
+  const { data: found, error: findErr } = await supabase
+    .from('work_assignments')
+    .select('*')
+    .eq('id', assignmentId)
+    .eq('company_id', supervisor.company_id)
+    .maybeSingle();
+  if (findErr) throw new Error(`assignment lookup failed: ${findErr.message}`);
+  const assignment = found as AssignmentRow | null;
+  if (!assignment) return json({ error: 'Assignment not found in your company' }, 404);
+
+  // 4. Completed and cancelled assignments are frozen — no further changes.
+  if (assignment.status === 'completed' || assignment.status === 'cancelled') {
+    return json({
+      error: `Assignment is '${assignment.status}' and can no longer be changed`,
+      current_status: assignment.status,
+    }, 409);
+  }
+
+  // 5. No-op guard: setting the same status is rejected as a conflict.
+  if (assignment.status === nextStatus) {
+    return json({ error: `Assignment is already '${nextStatus}'`, current_status: assignment.status }, 409);
+  }
+
+  // 6. Allowed transitions (supervisor-side):
+  //      pending      -> in_progress | cancelled | overdue
+  //      in_progress  -> completed    | cancelled | overdue
+  //      overdue      -> in_progress | cancelled   (reopen or cancel)
+  const ALLOWED: Record<string, string[]> = {
+    pending: ['in_progress', 'cancelled', 'overdue'],
+    in_progress: ['completed', 'cancelled', 'overdue'],
+    overdue: ['in_progress', 'cancelled'],
+  };
+  const allowed = ALLOWED[assignment.status] ?? [];
+  if (!allowed.includes(nextStatus)) {
+    return json({
+      error: `Invalid status transition: '${assignment.status}' -> '${nextStatus}' (allowed: ${allowed.join(', ')})`,
+      current_status: assignment.status,
+    }, 409);
+  }
+
+  // 7. Apply the update (RLS company-wide UPDATE policy covers supervisors).
+  const { data: updated, error: updateErr } = await supabase
+    .from('work_assignments')
+    .update({ status: nextStatus })
+    .eq('id', assignment.id)
+    .eq('company_id', supervisor.company_id)
+    .select();
+  if (updateErr) {
+    console.error('[supervisor] assignment update error:', updateErr.message);
+    return json({ error: 'Failed to update assignment' }, 500);
+  }
+  const row = (updated ?? [])[0] as AssignmentRow | undefined;
+  if (!row) return json({ error: 'Failed to update assignment' }, 500);
+  return json({ data: shapeAssignment(row) }, 200);
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
@@ -485,6 +791,30 @@ function shapeSubmission(s: SubmissionRow): Record<string, unknown> {
     attachment_url: s.attachment_url ?? null,       // after migration 20261113170001
     notes: s.notes,
     submitted_at: s.submitted_at,
+  };
+}
+
+/**
+ * Shape one assignment row for the API response: flatten the labourer join,
+ * parse machine/product from the description, include the assignment date.
+ */
+function shapeAssignment(
+  a: AssignmentRow,
+): Record<string, unknown> {
+  const { machine_number, product_type } = parseMachineProduct(a.description);
+  return {
+    id: a.id,
+    title: a.title,
+    description: a.description,
+    machine_number,
+    product_type,
+    quantity_target: a.quantity_target,
+    rate_per_unit: a.rate_per_unit,
+    due_date: a.due_date,
+    status: a.status,
+    accepted_at: a.accepted_at ?? null,
+    assigned_by: a.assigned_by ?? null, // after migration 20261113180001
+    assignment_date: a.created_at,
   };
 }
 
