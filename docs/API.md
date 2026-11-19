@@ -778,7 +778,63 @@ Shared rules (same model as half-day approval, §7):
 
 ---
 
-## 14. CORS
+## 14. Supervisor labourers
+
+Directory of the supervisor's company labourers. "Assigned to the supervisor"
+= same company (no supervisor→labourer assignment table exists in the schema).
+Sensitive auth data (`user_id`) is never returned.
+
+### GET /supervisor/labourers
+
+Response `200` — one row per worker, each with their current (open) assignment:
+
+```json
+{
+  "data": [
+    {
+      "id": "8acf0cb9-...",
+      "labour_name": "Anmol Worker",
+      "employee_code": "EMP-001",
+      "phone": "9998887776",
+      "employment_type": "full_time",
+      "wage_type": "monthly",
+      "hourly_rate": 120.5,
+      "profile_status": "active",
+      "member_since": "2026-11-16T07:27:29Z",
+      "current_assignment": {
+        "id": "735863d5-...",
+        "title": "Weaving shift B - batch 23",
+        "machine_number": "MC-12",
+        "product_type": "Cotton fabric 40s",
+        "quantity_target": 300,
+        "due_date": "2026-11-26",
+        "status": "pending",
+        "accepted_at": null,
+        "assignment_date": "2026-11-19T07:58:57Z"
+      }
+    }
+  ]
+}
+```
+
+`current_assignment` is `null` when the labourer has no open (pending /
+in_progress / overdue) assignment. Supervisors themselves are not listed.
+
+### GET /supervisor/labourers/:id
+
+Response `200` — one labourer's profile plus their 10 most recent assignments
+(same shape as `current_assignment`, under `assignments`), plus `role` and
+`metadata`.
+
+Errors (both endpoints):
+- Worker token → `403` "Supervisor role required"
+- No token → `401`
+- Non-UUID id → `400` "labourer id must be a valid UUID"
+- Unknown id / another company's labourer → `404` (no existence leak)
+
+---
+
+## 15. CORS
 
 All endpoints answer `OPTIONS` with `200` and permissive CORS headers, so you can
 also call them from a browser app.

@@ -9,6 +9,9 @@
 //                                          (filters: ?labour_id= ?date= ?from= ?to=)
 //   GET /supervisor/attendance-summary  -> present/absent/half-day counts for one date
 //                                          (?date=YYYY-MM-DD, default = today)
+//   GET /supervisor/labourers           -> labourers in my company, each with their
+//                                          current (open) assignment
+//   GET /supervisor/labourers/<uuid>    -> one labourer's details + recent assignments
 //   POST   /supervisor/assignments      -> assign a machine/task to a labourer
 //   GET    /supervisor/assignments      -> assignments I created (?labour_id= ?date= ?status=)
 //   PATCH  /supervisor/assignments      -> update one assignment's status
@@ -78,8 +81,52 @@ interface SupervisorProfile {
   role: string | null;
 }
 
-// Valid values of the assignment_status enum (same list as the assignments fn).
+// Valid values of the assignment_status enum (transitions are enforced in the PATCH handler).
 const STATUSES = ['pending', 'in_progress', 'completed', 'cancelled', 'overdue'] as const;
+
+// Row shape for labourer profiles (subset used by the labourers endpoints).
+interface LabourerProfileRow {
+  id: string;
+  full_name: string;
+  employee_code: string;
+  phone: string | null;
+  role: string | null;
+  employment_type: string;
+  wage_type: string;
+  hourly_rate: string | null;
+  status: string;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+}
+
+// Row shape for the open-assignment lookup (subset of work_assignments).
+interface OpenAssignmentRow {
+  id: string;
+  labour_profile_id?: string;
+  title: string;
+  description: string | null;
+  quantity_target: number | null;
+  due_date: string | null;
+  status: string;
+  accepted_at?: string | null;
+  created_at: string;
+}
+
+/** Shape one open assignment for the labourers endpoints (machine/product parsed). */
+function shapeOpenAssignment(a: OpenAssignmentRow): Record<string, unknown> {
+  const { machine_number, product_type } = parseMachineProduct(a.description);
+  return {
+    id: a.id,
+    title: a.title,
+    machine_number,
+    product_type,
+    quantity_target: a.quantity_target,
+    due_date: a.due_date,
+    status: a.status,
+    accepted_at: a.accepted_at ?? null,
+    assignment_date: a.created_at,
+  };
+}
 
 interface AssignmentRow {
   id: string;
@@ -168,7 +215,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
         return await handleOvertimeDecision(req, supabase, userId, route === 'approve' ? 'approved' : 'rejected');
       }
     }
-    return json({ error: 'Unknown route. Use /supervisor/work-history, /supervisor/work-summary, /supervisor/attendance, /supervisor/attendance-summary or /supervisor/assignments' }, 404);
+    // Labourer directory: /supervisor/labourers (list) and
+    // /supervisor/labourers/<uuid> (detail). The detail route's last segment is
+    // a UUID, so route !== 'labourers' there — check the segment before it.
+    if (route === 'labourers') return await handleLabourers(supabase, userId);
+    const prevSeg = new URL(req.url).pathname.replace(/\/+$/, '').split('/').slice(-2, -1)[0];
+    if (prevSeg === 'labourers') return await handleLabourerDetail(req, supabase, userId, route);
+    return json({ error: 'Unknown route. Use /supervisor/work-history, /supervisor/work-summary, /supervisor/attendance, /supervisor/attendance-summary, /supervisor/assignments or /supervisor/labourers' }, 404);
   } catch (err) {
     console.error('[supervisor] unhandled error:', err);
     return json({ error: 'Internal server error' }, 500);
@@ -1020,4 +1073,136 @@ async function handleOvertimeDecision(
 
   // 8. Success — return the updated row.
   return json({ data: updated }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// GET /supervisor/labourers — labourers in my company (with current assignment)
+// ---------------------------------------------------------------------------
+/**
+ * Directory of my company's labourers: name, id, phone, profile details and
+ * their CURRENT (open) assignment. "Assigned to the supervisor" = same company
+ * (no supervisor->labourer assignment table exists in the schema).
+ * Sensitive auth data (user_id) is never returned.
+ */
+async function handleLabourers(
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. All labourer profiles in MY company (RLS company-wide SELECT makes this
+  //    legal). Only workers — supervisors are not "labourers".
+  const { data, error } = await supabase
+    .from('labour_profiles')
+    .select('id, full_name, employee_code, phone, role, employment_type, wage_type, hourly_rate, status, created_at')
+    .eq('company_id', supervisor.company_id)
+    .order('employee_code', { ascending: true });
+  if (error) throw new Error(`labourers query failed: ${error.message}`);
+
+  const profiles = (data ?? []) as LabourerProfileRow[];
+  const workers = profiles.filter((p) => !(SUPERVISOR_ROLES as readonly string[]).includes((p.role ?? '').toLowerCase()));
+  if (workers.length === 0) return json({ data: [] }, 200);
+
+  // 3. Open assignments (pending/in_progress/overdue) for those labourers —
+  //    one small query instead of one per labourer (no N+1).
+  const { data: openRows, error: openErr } = await supabase
+    .from('work_assignments')
+    .select('id, labour_profile_id, title, description, quantity_target, due_date, status, created_at')
+    .eq('company_id', supervisor.company_id)
+    .in('labour_profile_id', workers.map((w) => w.id))
+    .in('status', ['pending', 'in_progress', 'overdue'])
+    .order('created_at', { ascending: false });
+  if (openErr) throw new Error(`open assignments query failed: ${openErr.message}`);
+
+  // 4. Map each labourer to their most recent open assignment (if any).
+  const openByLabour = new Map<string, OpenAssignmentRow>();
+  for (const a of (openRows ?? []) as OpenAssignmentRow[]) {
+    const lid = a.labour_profile_id;
+    if (lid && !openByLabour.has(lid)) openByLabour.set(lid, a);
+  }
+
+  // 5. Shape the response rows.
+  const rows = workers.map((p) => {
+    const a = openByLabour.get(p.id);
+    const shaped = a ? shapeOpenAssignment(a) : null;
+    return {
+      id: p.id,
+      labour_name: p.full_name,
+      employee_code: p.employee_code,
+      phone: p.phone,
+      employment_type: p.employment_type,
+      wage_type: p.wage_type,
+      hourly_rate: p.hourly_rate,
+      profile_status: p.status,
+      member_since: p.created_at,
+      current_assignment: shaped,
+    };
+  });
+  return json({ data: rows }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// GET /supervisor/labourers/<uuid> — one labourer's details
+// ---------------------------------------------------------------------------
+/**
+ * One labourer's profile + their recent assignments (newest first).
+ * 404 for unknown ids AND other companies' labourers (no existence leak).
+ */
+async function handleLabourerDetail(
+  req: Request,
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+  labourId: string,
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. The id must be a valid UUID — a non-UUID would make PostgREST throw a
+  //    cast error (22P02) that surfaces as a 500.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(labourId)) {
+    return json({ error: 'labourer id must be a valid UUID — copy an id from GET /supervisor/labourers' }, 400);
+  }
+
+  // 3. Load the profile — must be in MY company.
+  const { data: profile, error: pErr } = await supabase
+    .from('labour_profiles')
+    .select('id, full_name, employee_code, phone, role, employment_type, wage_type, hourly_rate, status, metadata, created_at')
+    .eq('id', labourId)
+    .eq('company_id', supervisor.company_id)
+    .maybeSingle();
+  if (pErr) throw new Error(`labourer lookup failed: ${pErr.message}`);
+  const p = profile as LabourerProfileRow | null;
+  if (!p) return json({ error: 'Labourer not found in your company' }, 404);
+
+  // 4. Their assignments, newest first (RLS company-wide SELECT makes this
+  //    legal). Limited to 10 — this is a profile view, not a full history.
+  const { data: assignments, error: aErr } = await supabase
+    .from('work_assignments')
+    .select('id, title, description, quantity_target, due_date, status, accepted_at, created_at')
+    .eq('labour_profile_id', p.id)
+    .eq('company_id', supervisor.company_id)
+    .order('created_at', { ascending: false })
+    .limit(10);
+  if (aErr) throw new Error(`labourer assignments query failed: ${aErr.message}`);
+
+  // 5. Shape the response. user_id is deliberately excluded (auth data).
+  return json({
+    data: {
+      id: p.id,
+      labour_name: p.full_name,
+      employee_code: p.employee_code,
+      phone: p.phone,
+      role: p.role,
+      employment_type: p.employment_type,
+      wage_type: p.wage_type,
+      hourly_rate: p.hourly_rate,
+      profile_status: p.status,
+      metadata: p.metadata ?? null,
+      member_since: p.created_at,
+      assignments: ((assignments ?? []) as OpenAssignmentRow[]).map(shapeOpenAssignment),
+    },
+  }, 200);
 }
