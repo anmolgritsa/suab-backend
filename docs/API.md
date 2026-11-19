@@ -726,7 +726,59 @@ route · `405` non-GET/POST/PATCH.
 
 ---
 
-## 13. CORS
+## 13. Supervisor — overtime approval (Step 4.12)
+
+Base: `https://ooyidpdgnelhxpoxjlkv.supabase.co/functions/v1/supervisor`
+(same function as §10–§12; supervisor token required).
+
+### GET /supervisor/overtime/pending — pending requests
+
+Response `200`:
+
+```json
+{
+  "data": [
+    {
+      "id": "d45812ec-...",
+      "labour_name": "Anmol Worker",
+      "employee_code": "EMP-001",
+      "date": "2026-11-29",
+      "hours": 1.5,
+      "reason": "Shipping deadline",
+      "status": "pending",
+      "requested_at": "2026-11-19T..."
+    }
+  ]
+}
+```
+
+### PATCH /supervisor/overtime/approve — approve one request
+
+Body: `{ "request_id": "<uuid from pending list>" }`
+
+Response `200`: `{ "data": { "id": "...", "status": "approved",
+"reviewed_by": "<supervisor profile id>", "reviewed_at": "...", ... } }`
+
+### PATCH /supervisor/overtime/reject — reject one request
+
+Body: `{ "request_id": "<uuid>", "review_notes": "optional rejection reason" }`
+
+`review_notes` is **optional** here (unlike half-day, where it is required).
+It stores in `overtime_requests.review_notes` — a column added by migration
+`20261113190001`. Until that migration is applied, a reject WITH notes returns
+`503` + hint (approve and reject-without-notes work fine).
+
+Shared rules (same model as half-day approval, §7):
+- Worker token → `403` "Supervisor role required"
+- Self-decision (supervisor's own request) → `403`
+- Already decided → `409` with `current_status` (only `pending` can be decided;
+  two supervisors racing → one wins, the other gets 409)
+- Unknown id / another company's request → `404` (no existence leak)
+- Missing id / bad UUID → `400`
+
+---
+
+## 14. CORS
 
 All endpoints answer `OPTIONS` with `200` and permissive CORS headers, so you can
 also call them from a browser app.

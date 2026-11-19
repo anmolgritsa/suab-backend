@@ -12,6 +12,9 @@
 //   POST   /supervisor/assignments      -> assign a machine/task to a labourer
 //   GET    /supervisor/assignments      -> assignments I created (?labour_id= ?date= ?status=)
 //   PATCH  /supervisor/assignments      -> update one assignment's status
+//   GET    /supervisor/overtime/pending -> pending overtime requests (my company)
+//   PATCH  /supervisor/overtime/approve -> approve one pending overtime request
+//   PATCH  /supervisor/overtime/reject  -> reject one (optional reason in review_notes)
 //
 // AUTH
 //   Same pattern as the other functions: anon key + the caller's user JWT.
@@ -45,6 +48,15 @@
 //     endpoint skips that column and says so in the response.
 //   - assignment_status enum: pending | in_progress | completed | cancelled
 //     | overdue.
+//   overtime_requests: id, company_id, labour_profile_id, date, hours
+//   numeric(4,2) CHECK (>0), reason (the WORKER's reason), status
+//   (request_status: pending/approved/rejected/cancelled), reviewed_by,
+//   reviewed_at, timestamps. Partial unique index uq_overtime_requests_pending
+//   (labour_profile_id, date) WHERE status='pending' — one pending request per
+//   labourer per date.
+//   - No rejection-reason column: migration 20261113190001 (DRAFT, not
+//     applied) adds review_notes. Until then reject stores status/reviewer
+//     and says the note was not stored.
 //
 // DATE HANDLING
 //   ?date / ?from / ?to are company-timezone calendar dates (companies.settings
@@ -144,6 +156,17 @@ Deno.serve(async (req: Request): Promise<Response> => {
       if (req.method === 'POST') return await handleCreateAssignment(req, supabase, userId);
       if (req.method === 'PATCH') return await handleUpdateAssignment(req, supabase, userId);
       return await handleListAssignments(req, supabase, userId); // GET
+    }
+    // Overtime approval: /supervisor/overtime/<action> — action is the last
+    // segment (pending | approve | reject). Strip the action from the path and
+    // confirm the segment before it is "overtime" (so /assignments/... etc.
+    // never collide).
+    if (route === 'pending' || route === 'approve' || route === 'reject') {
+      const prev = new URL(req.url).pathname.replace(/\/+$/, '').split('/').slice(-2, -1)[0];
+      if (prev === 'overtime') {
+        if (route === 'pending') return await handleOvertimePending(supabase, userId);
+        return await handleOvertimeDecision(req, supabase, userId, route === 'approve' ? 'approved' : 'rejected');
+      }
     }
     return json({ error: 'Unknown route. Use /supervisor/work-history, /supervisor/work-summary, /supervisor/attendance, /supervisor/attendance-summary or /supervisor/assignments' }, 404);
   } catch (err) {
@@ -833,3 +856,168 @@ function parseMachineProduct(description: string | null): { machine_number: stri
   };
 }
 
+// ---------------------------------------------------------------------------
+// GET /supervisor/overtime/pending — pending overtime requests (my company)
+// ---------------------------------------------------------------------------
+/**
+ * Pending overtime requests from my company's labourers, newest first.
+ * Shows labour name, requested hours, request date, request time, reason.
+ */
+async function handleOvertimePending(
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. Pending requests in my company, newest first, labourer embedded.
+  //    RLS (company-wide SELECT) makes this query legal for a supervisor.
+  const { data, error } = await supabase
+    .from('overtime_requests')
+    .select('id, date, hours, reason, status, created_at, labour_profiles(full_name, employee_code)')
+    .eq('company_id', supervisor.company_id)
+    .eq('status', 'pending')
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(`overtime pending query failed: ${error.message}`);
+
+  // 3. Flatten the join for a simple response shape.
+  const rows = (data ?? []) as Array<Record<string, unknown>>;
+  const out = rows.map((r) => {
+    const lp = r['labour_profiles'] as { full_name?: string; employee_code?: string } | null;
+    return {
+      id: r['id'],
+      labour_name: lp?.full_name ?? null,
+      employee_code: lp?.employee_code ?? null,
+      date: r['date'],
+      hours: r['hours'],
+      reason: r['reason'],
+      status: r['status'],
+      requested_at: r['created_at'],
+    };
+  });
+  return json({ data: out }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /supervisor/overtime/approve | /supervisor/overtime/reject
+// ---------------------------------------------------------------------------
+/**
+ * Decide a pending overtime request: status -> approved | rejected.
+ * Records reviewed_by (supervisor profile id) + reviewed_at, and review_notes
+ * (the optional rejection reason) when the column exists.
+ */
+async function handleOvertimeDecision(
+  req: Request,
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+  decision: 'approved' | 'rejected',
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. Parse + validate the body: request_id required; review_notes optional.
+  let body: Record<string, unknown>;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: 'Request body must be valid JSON' }, 400);
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return json({ error: 'Request body must be a JSON object' }, 400);
+  }
+  const requestId = body['request_id'];
+  if (typeof requestId !== 'string' || requestId.length === 0) {
+    return json({ error: 'request_id is required' }, 400);
+  }
+  // Must be a valid UUID — a non-UUID would make PostgREST throw a cast
+  // error (22P02) that surfaces as a 500. Copy ids from
+  // GET /supervisor/overtime/pending.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) {
+    return json({ error: 'request_id must be a valid UUID — copy an id from GET /supervisor/overtime/pending' }, 400);
+  }
+  // Optional supervisor note (mainly the rejection reason). The task allows
+  // rejecting WITHOUT a reason, so unlike half-day this is not required.
+  const notes = body['review_notes'];
+  if (notes !== undefined && notes !== null && (typeof notes !== 'string' || notes.length > 1000)) {
+    return json({ error: 'review_notes must be a string of at most 1000 characters' }, 400);
+  }
+
+  // 3. Load the request. RLS (company-wide SELECT) lets a supervisor read it;
+  //    filtering by company_id keeps the scope tight.
+  const { data: row, error: rowErr } = await supabase
+    .from('overtime_requests')
+    .select('id, company_id, labour_profile_id, status')
+    .eq('id', requestId)
+    .eq('company_id', supervisor.company_id)
+    .limit(1)
+    .maybeSingle();
+  if (rowErr) throw new Error(`overtime lookup failed: ${rowErr.message}`);
+  if (!row) {
+    // Unknown id OR another company's request — same 404, no existence leak.
+    return json({ error: 'Overtime request not found in your company' }, 404);
+  }
+  const req0 = row as { labour_profile_id: string; status: string };
+
+  // 4. A supervisor can never decide their own request.
+  if (req0.labour_profile_id === supervisor.id) {
+    return json({ error: 'You cannot approve or reject your own overtime request' }, 403);
+  }
+
+  // 5. Only PENDING requests can be decided (prevents duplicate approvals).
+  if (req0.status !== 'pending') {
+    return json({
+      error: `Request cannot be ${decision}: current status is '${req0.status}' (only 'pending' can be decided)`,
+      current_status: req0.status,
+    }, 409);
+  }
+
+  // 6. Build the update. reviewed_at is set by us (the DB CHECK requires it);
+  //    reviewed_by = the supervisor's labour_profiles.id.
+  const updates: Record<string, unknown> = {
+    status: decision,
+    reviewed_by: supervisor.id,
+    reviewed_at: new Date().toISOString(),
+  };
+  if (typeof notes === 'string') updates['review_notes'] = notes;
+
+  const { data: updated, error: updateErr } = await supabase
+    .from('overtime_requests')
+    .update(updates)
+    .eq('id', requestId)
+    .eq('status', 'pending') // in the WHERE: two supervisors racing -> one wins
+    .eq('company_id', supervisor.company_id)
+    .select()
+    .maybeSingle();
+
+  if (updateErr) {
+    // PGRST204 = column not found -> review_notes migration not applied yet.
+    if (updateErr.code === 'PGRST204' && 'review_notes' in updates) {
+      return json({
+        error: 'review_notes cannot be stored yet — migration 20261113190001 (overtime review notes) is not applied',
+        hint: 'Apply migration 20261113190001 to store rejection reasons. Approve works without it.',
+      }, 503);
+    }
+    console.error('[supervisor] overtime update error:', updateErr.message);
+    return json({ error: 'Failed to update overtime request' }, 500);
+  }
+
+  // 7. 0 rows updated = lost a race (another supervisor decided first) or RLS
+  //    blocked the write. Both surface as 409 with the fresh status.
+  if (!updated) {
+    const { data: fresh } = await supabase
+      .from('overtime_requests')
+      .select('status')
+      .eq('id', requestId)
+      .limit(1);
+    const freshStatus = (fresh as { status: string }[] | null)?.[0]?.status ?? 'unknown';
+    return json({
+      error: `Request was just decided by someone else (current status: '${freshStatus}')`,
+      current_status: freshStatus,
+    }, 409);
+  }
+
+  // 8. Success — return the updated row.
+  return json({ data: updated }, 200);
+}
