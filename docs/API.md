@@ -545,7 +545,110 @@ assignment (title, machine number, product type, target, status).
 
 ---
 
-## 10. CORS
+## 10. Supervisor work history & summary (supervisor role required)
+
+Roles that count: `owner`, `admin`, `manager`, `supervisor` — workers get `403`.
+Scope: all labourers in the supervisor's company (no supervisor→labourer
+assignment table exists in the schema).
+
+### GET /supervisor/work-history
+
+Filters (all optional): `?labour_id=<uuid>` · `?from=YYYY-MM-DD` · `?to=YYYY-MM-DD`
+(dates are company-timezone calendar days; `from > to` → `400`).
+
+```bash
+curl.exe -s "https://ooyidpdgnelhxpoxjlkv.supabase.co/functions/v1/supervisor/work-history?from=2026-11-18&to=2026-11-18" -H "Authorization: Bearer SUPERVISOR_JWT"
+```
+
+`200`:
+```json
+{ "data": [ {
+    "id": "…",
+    "labour": { "id": "…", "name": "Anmol Worker", "employee_code": "EMP-001" },
+    "assignment": { "id": "…", "title": "Weaving line 3 - cotton batch",
+                    "machine_number": "MC-07", "product_type": "Cotton fabric 40s",
+                    "quantity_target": 500, "status": "in_progress" },
+    "quantity_successful": 120, "quantity_rejected": null, "quantity_reusable": null,
+    "attachment_url": null, "notes": "Line A output",
+    "submitted_at": "2026-11-18T07:48:16.110572+00:00" } ] }
+```
+`quantity_rejected` / `quantity_reusable` / `attachment_url` are `null` until
+migration `20261113170001` is applied.
+
+### GET /supervisor/work-summary
+
+Optional `?date=YYYY-MM-DD` — default is **today in the company timezone**
+(`Asia/Kolkata` unless `companies.settings.timezone` says otherwise).
+
+```bash
+curl.exe -s "https://ooyidpdgnelhxpoxjlkv.supabase.co/functions/v1/supervisor/work-summary?date=2026-11-18" -H "Authorization: Bearer SUPERVISOR_JWT"
+```
+
+`200`:
+```json
+{ "data": { "date": "2026-11-18",
+            "totals": { "successful": 480, "rejected": 0, "reusable": 0 },
+            "submissions_count": 5, "labourers_count": 1 } }
+```
+
+Errors: `401` no/bad token · `403` not a supervisor · `400` bad `labour_id` /
+bad date / `from > to` · `404` unknown route · `405` non-GET.
+
+---
+
+## 11. Supervisor attendance (supervisor role required)
+
+Base: `https://ooyidpdgnelhxpoxjlkv.supabase.co/functions/v1`
+
+### GET /supervisor/attendance
+
+Attendance records for the supervisor's company. Filters (all optional):
+`?labour_id=<uuid>` · `?date=YYYY-MM-DD` · `?from=YYYY-MM-DD&to=YYYY-MM-DD`
+(inclusive range; `date` and `from/to` are mutually exclusive in practice —
+`date` wins as an exact match).
+
+Response `200`:
+```json
+{
+  "data": [
+    {
+      "id": "d5f79aae-...",
+      "labour": { "id": "8acf0cb9-...", "name": "Anmol Worker", "employee_code": "EMP-001" },
+      "date": "2026-11-16",
+      "status": "on_duty",
+      "check_in": "2026-11-16T10:05:00+00:00",
+      "check_out": "2026-11-16T18:30:00+00:00",
+      "shift_id": null
+    }
+  ]
+}
+```
+`status` is the `attendance_status` enum: `present / absent / late / half_day /
+leave / holiday / on_duty`. Times are UTC ISO strings.
+
+### GET /supervisor/attendance-summary
+
+Counts for one date (default: today in the company timezone). `?date=YYYY-MM-DD`.
+
+Response `200`:
+```json
+{
+  "data": {
+    "date": "2026-11-16",
+    "totals": { "present": 1, "absent": 0, "half_day": 0, "leave": 0, "holiday": 0 },
+    "records_count": 1
+  }
+}
+```
+The `present` bucket includes `present`, `late` and `on_duty` (all mean "was at
+work"). `records_count` is the raw number of attendance rows that day.
+
+Errors: `401` no/bad token · `403` not a supervisor · `400` bad `labour_id` /
+bad date / `from > to` · `404` unknown route · `405` non-GET.
+
+---
+
+## 12. CORS
 
 All endpoints answer `OPTIONS` with `200` and permissive CORS headers, so you can
 also call them from a browser app.
