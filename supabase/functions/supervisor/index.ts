@@ -112,6 +112,23 @@ interface OpenAssignmentRow {
   created_at: string;
 }
 
+// Valid update types (must match the labour_update_type enum in migration
+// 20261113200001 — same list as the labour-side /updates function).
+const UPDATE_TYPES = ['machine_maintenance', 'machine_breakdown', 'raw_material_defect', 'other'] as const;
+
+// Row shape for a labour_updates row (migration 20261113200001).
+interface UpdateRow {
+  id: string;
+  company_id: string;
+  labour_profile_id: string;
+  update_type: string;
+  description: string;
+  voice_note_url: string | null;
+  image_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 /** Shape one open assignment for the labourers endpoints (machine/product parsed). */
 function shapeOpenAssignment(a: OpenAssignmentRow): Record<string, unknown> {
   const { machine_number, product_type } = parseMachineProduct(a.description);
@@ -215,6 +232,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
         return await handleOvertimeDecision(req, supabase, userId, route === 'approve' ? 'approved' : 'rejected');
       }
     }
+    // Labour updates feed: /supervisor/updates — field reports from my
+    // company's labourers (filters: ?labour_id= ?type= ?from= ?to=).
+    if (route === 'updates') return await handleUpdates(req, supabase, userId);
     // Labourer directory: /supervisor/labourers (list) and
     // /supervisor/labourers/<uuid> (detail). The detail route's last segment is
     // a UUID, so route !== 'labourers' there — check the segment before it.
@@ -1205,4 +1225,87 @@ async function handleLabourerDetail(
       assignments: ((assignments ?? []) as OpenAssignmentRow[]).map(shapeOpenAssignment),
     },
   }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// GET /supervisor/updates — field reports from my company's labourers
+// ---------------------------------------------------------------------------
+/**
+ * Labour updates (machine maintenance / breakdown / raw-material defects /
+ * other), newest first. Filters: ?labour_id= ?type= ?from= ?to=.
+ * "Assigned to the supervisor" = same company (no supervisor->labourer
+ * assignment table exists in the schema).
+ * The labour_updates table only exists after migration 20261113200001 — until
+ * then this returns an empty list with a hint instead of a 500.
+ */
+async function handleUpdates(
+  req: Request,
+  supabase: ReturnType<typeof createClientForUser>,
+  userId: string,
+): Promise<Response> {
+  // 1. Must be a supervisor.
+  const supervisor = await requireSupervisor(supabase, userId);
+  if (!supervisor) return json({ error: 'Supervisor role required' }, 403);
+
+  // 2. Validate the optional filters.
+  //    ?labour_id= -> one labourer (must be a valid UUID, else PostgREST
+  //                   22P02 -> 500)
+  //    ?type=      -> one update type (must match the enum)
+  //    ?from/?to=  -> calendar-date range on created_at (company timezone ->
+  //                   UTC window, same convention as the other endpoints)
+  const url = new URL(req.url);
+  const labourId = url.searchParams.get('labour_id');
+  if (labourId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(labourId)) {
+    return json({ error: 'labour_id must be a valid UUID' }, 400);
+  }
+  const type = url.searchParams.get('type');
+  if (type && !UPDATE_TYPES.includes(type as typeof UPDATE_TYPES[number])) {
+    return json({ error: `type must be one of: ${UPDATE_TYPES.join(', ')}` }, 400);
+  }
+  const from = url.searchParams.get('from');
+  const to = url.searchParams.get('to');
+  if (from && !isValidDate(from)) return json({ error: 'from must be a valid date in YYYY-MM-DD format' }, 400);
+  if (to && !isValidDate(to)) return json({ error: 'to must be a valid calendar date in YYYY-MM-DD format' }, 400);
+  if (from && to && from > to) return json({ error: 'from must be on or before to' }, 400);
+
+  // 3. Query updates in MY company, newest first, labourer embedded.
+  //    RLS (company-wide SELECT) makes this legal.
+  let query = supabase
+    .from('labour_updates')
+    .select('*, labour_profiles(id, full_name, employee_code)')
+    .eq('company_id', supervisor.company_id)
+    .order('created_at', { ascending: false })
+    .limit(200);
+
+  if (labourId) query = query.eq('labour_profile_id', labourId);
+  if (type) query = query.eq('update_type', type);
+  const tz = await companyTimezone(supabase, supervisor.company_id);
+  if (from) query = query.gte('created_at', dayStartUtc(from, tz));
+  if (to) query = query.lte('created_at', dayEndUtc(to, tz));
+
+  const { data, error } = await query;
+  // Table missing -> migration 20261113200001 not applied; empty list + hint.
+  if (error && (error.code === '42P01' || error.code === 'PGRST205')) {
+    return json({
+      data: [],
+      hint: 'Migration 20261113200001 (labour_updates) is not applied yet — no updates exist to show',
+    }, 200);
+  }
+  if (error) throw new Error(`updates query failed: ${error.message}`);
+
+  // 4. Shape each row: flatten the join.
+  const rows = ((data ?? []) as (UpdateRow & { labour_profiles?: { id: string; full_name: string; employee_code: string } | null })[])
+    .map((r) => {
+      const lp = r.labour_profiles ?? null;
+      return {
+        id: r.id,
+        labour: lp ? { id: lp.id, name: lp.full_name, employee_code: lp.employee_code } : null,
+        update_type: r.update_type,
+        description: r.description,
+        voice_note_url: r.voice_note_url,
+        image_url: r.image_url,
+        submitted_at: r.created_at,
+      };
+    });
+  return json({ data: rows }, 200);
 }

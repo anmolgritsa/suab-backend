@@ -834,7 +834,44 @@ Errors (both endpoints):
 
 ---
 
-## 15. CORS
+## 15. Emergency / SOS
+
+Base: `/functions/v1/emergency` — worker triggers, supervisor manages.
+
+### POST `/emergency` — trigger an SOS (worker)
+Headers: `Authorization: Bearer <worker token>`, `Content-Type: application/json`
+```json
+{ "emergency_type": "medical", "latitude": 12.9716, "longitude": 77.5946, "description": "Hand injury at dyeing unit" }
+```
+- `emergency_type` required: `accident | medical | fire | other`
+- `latitude`/`longitude` optional numbers (±90 / ±180) — a failed GPS fix never blocks an SOS
+- `description` optional, ≤ 500 chars
+- `201` → `{ "data": { "id": "...", "status": "pending", ... } }`
+- `409` if you already have a PENDING alert (with `existing_alert`)
+- company_id / labour_profile_id are always derived from the JWT — never from the body
+
+### GET `/emergency` — alert queue (supervisor)
+Headers: `Authorization: Bearer <supervisor token>`
+- Filters: `?status=pending|acknowledged|resolved` · `?labour_id=<uuid>`
+- `200` → `{ "data": [ { "id", "labour_name", "employee_code", "emergency_type", "latitude", "longitude", "status", "created_at", ... } ] }` (newest first)
+
+### PATCH `/emergency/<alert_id>` — acknowledge / resolve (supervisor)
+Headers: `Authorization: Bearer <supervisor token>`, `Content-Type: application/json`
+```json
+{ "status": "acknowledged" }
+```
+- Transitions: `pending → acknowledged → resolved`; `resolved` is frozen
+- Records `acknowledged_by`/`acknowledged_at` or `resolved_by`/`resolved_at`
+- `200` updated alert · `409` invalid transition · `403` worker token · `404` unknown id · `400` bad UUID/status
+
+### Notifications
+The pending queue (GET with `?status=pending`) IS the notification channel for
+now — supervisors poll it. Push/email/Telegram delivery and factory-bell
+hardware integration are separate future steps.
+
+---
+
+## 16. CORS
 
 All endpoints answer `OPTIONS` with `200` and permissive CORS headers, so you can
 also call them from a browser app.
